@@ -1,3 +1,19 @@
+# Native export route-name fix — experimental
+
+- Always serialize canonical workflow names; duplicate legacy enum values can no longer turn DC into MainRecovery during Native export.
+- Accept LaunchRecovery, MainRecovery and DC as old DC keys; preserve canonical-key precedence and keep the required-route safety check.
+- Preserve authored roots/children while migrating old macros. Do not change firmware, guard policy, buff timing, shift schedule, cycle count or calibrated settings.
+- Add actual serializer migration/regression tests and Native compiler alias tests. Experimental branch only; hardware flash/testing remains manual.
+
+# ShiftSchedule experimental build
+
+- Independent day/night HH:mm ranges, midnight crossing and deliberate gap ignore; Windows username mapping remains explicit in Status settings.
+- Two editable native SwitchToDay / SwitchToNight routes; no hidden restart and no Scheduled Task.
+- Bridge reports local Windows minute only when clock capability is requested; identity-only older firmware remains compatible with the updated bridge.
+- Persist attempts and pending destination in A/B NVM before switch actions; atomically reset five-round count only after successful destination check. Stop/fresh manual start clears the retry budget.
+- Bounded three-minute reboot/desktop wait pauses with siren; Resume rechecks through Startup. Unknown identity stays blocked, never guessed.
+- Updated native SFT2 descriptor, template capability gate, Windows UI/save-load and real core/adapter/cycle/flash-store regression tests.
+
 ## Experimental: temporary Windows shift identity bridge
 
 - Editable Native-only identity checkpoint in Desktop/Startup launches a chosen
