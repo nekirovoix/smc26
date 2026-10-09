@@ -85,6 +85,158 @@ this grace.
 
 Playback is allocation-free and nonblocking; no additional hardware is required.
 
+## Autonomous shift wake (hostless)
+
+A portable board has no clock and no host helper, yet the next shift still has
+to start by itself. Two things therefore have to reach the board without a PC
+running: the authored windows, and the current time.
+
+* The authored schedule travels inside the flashed program as the same `SFT2`
+  shift descriptor the round uses, so the board reads it at boot with
+  `abvm_find_constant(ABVM_CONST_SHIFT)` and configures the scheduler before USB
+  is even attached. Waiting for a round to reach its shift check would close a
+  circle: that check belongs to the round the board was supposed to start, so a
+  freshly flashed board could never arm the first window it had to wake. Boot
+  reports the result as
+  `EVT|WAKE|schedule|source=program|enabled=|day=|night=|lead=`, or `source=none`
+  when the flashed project carries no schedule at all.
+* The clock has two independent sources and needs neither at any given moment.
+  The temporary Windows bridge reports the local wall clock on every shift
+  identity check, and `TIME!|HH:MM` stamps it once on demand from any host tool —
+  no bridge, no round, no software left running. The stamp retires the recovery
+  budget exactly like an accepted bridge sample, so it is the one click that
+  breaks the cold-start circle after a flash or a brownout.
+* The firmware converts whichever sample it gets into a monotonic deadline
+  instead of asking for a battery-backed RTC:
+
+* `wake_scheduler_sync()` turns "the next window start is at minute X" into
+  `deadline = now + (X - minute - lead)`. The nearest of the two window starts
+  wins, gaps between windows are ignored, and a sample taken exactly on a start
+  targets the other window.
+* The deadline is recomputed on every accepted `SHIFT2!` reply, so each round
+  re-synchronises the clock and clears the wake attempt counter.
+* The same sample anchors the wall clock, so `wake_scheduler_wall_minute()` turns
+  any later instant back into a minute of day. Every pulse log therefore carries
+  both the wall time and the authored target (`wall=07:58|target=08:00`), which
+  is what makes a hardware bring-up readable instead of guesswork.
+* Two independent wake sources sit on the host bus, and one pulse fires both. The
+  Pico is itself a HID keyboard whose descriptor advertises remote wake-up, so
+  `tud_remote_wakeup()` resumes the bus directly. The Arduino board raises
+  `RMWKUP` from its own suspended mouse interface, using one authored
+  `MMOVE|1,0,rel,2` on the internal lane. `WAKE_USE_PICO_WAKEUP` and
+  `WAKE_USE_ARM_PULSE` isolate a single path during bring-up. The Pico path is
+  gated on `tud_suspend_cb(remote_wakeup_en)`, because driving resume on a bus the
+  host never armed would be a protocol violation; `STATUS` reports that verdict
+  as `pico-rw`.
+* The Arduino board reports `EVT|HOSTUSB|UP|SUSPEND|DOWN`, so the wake is
+  verified rather than assumed: the board waits for `UP`, settles for
+  `WAKE_SETTLE_MS`, and only then starts the authored Startup route. If the
+  host never reports `UP` the attempt is retried after `WAKE_RETRY_MS`, up to
+  `WAKE_MAX_ATTEMPTS`.
+* A host that is already awake skips the pulse and starts the round directly.
+  That verdict comes from the bridge, though, and the bridge re-announces it
+  every two seconds, so a single `UP` report can be that old. The shortcut is
+  therefore taken only after the host has been reported awake for
+  `WAKE_HOST_AWAKE_GRACE_MS`, so a machine that suspends right at the deadline
+  still gets its pulse instead of silently losing the only wake of the window.
+* Every deadline logs one
+  `EVT|WAKE|due|manual=|dry=|attempts=|usb=|pico-usb=|pico-rw=` line naming the
+  inputs the decision used, and `WAKE?` reports the whole deadline state on
+  demand (`armed`, `manual`, `dry`, `synced`, `schedule`, `target`, `due-ms`,
+  `attempts`, `phase`, `recovery`, `host`, `pico-usb`, `pico-rw`), so a wake that
+  never left the board explains itself instead of looking like a dead wake path.
+  Every blocker reports itself once per deadline as
+  `ERR|WAKE|blocked|reason=round|recovery|calibration|state=|phase=|recovery=`,
+  because a deadline that fires nothing is otherwise invisible.
+* The wake path only stands down for a round that is actually driving the host
+  (`ABVM_STATUS_RUNNING` or `PAUSED`). Gating it on `STOPPED` disabled the whole
+  wake path after every flash, because `abvm_init()` leaves the VM in
+  `ABVM_STATUS_IDLE`: the board fired no pulse and wrote no line until an
+  operator pressed start/stop once.
+* A bridge clock sample never cancels an operator `WAKE!` test arm while the
+  authored schedule is off: there is nothing to replace it with, and disarming
+  there silently cancelled the only wake of the test.
+* A verified wake leaves the machine on the Windows lock screen, and the authored
+  macro language has no click opcode at all (ABVM knows motion, keys and typing
+  only), so nothing in the project can dismiss it. After the settle the firmware
+  therefore presses `VK_RETURN` `WAKE_DISMISS_PRESSES` times, paced by
+  `WAKE_DISMISS_GAP_MS`: hardware testing on the target showed that Enter alone
+  drops the lock screen and signs the machine in, so the pointer is never moved
+  and the round starts from the cursor position it expects. Measured on the
+  target, the bridge reports `UP` about 5 s after the resume, so `WAKE_SETTLE_MS`
+  is 15 s and the whole pulse-to-round sequence takes about 24 s. The step runs only
+  for a host this board actually woke; `WAKE_DISMISS_ENABLED 0` removes it for a
+  machine that does not lock on wake.
+* The two wake sources are independent and neither is gated on the other. The
+  Pico resumes the host bus from its own suspended port and needs nothing from
+  the Arduino board, so an unprobed, busy or faulted board can no longer stop the
+  machine from being woken — which is what used to happen, silently, because the
+  pulse path returned before it reached the log. Every skip is now reported:
+  `ERR|WAKE|pulse|pico-skipped|usb=|rw=` when the host never armed this board's
+  own remote wake-up, `ERR|WAKE|pulse|arm-skipped|ready=|busy=` when only the
+  Pico path went out, and `ERR|WAKE|pulse|wait|...` once while nothing can go out
+  yet.
+* The recovery path cannot park the wake machine: it is blocked on an
+  unreachable board or an unreadable store only until its deadline, and then
+  reports `ERR|WAKE|recovery|skipped|reason=arm|store` and lets the normal path
+  run again.
+* Logs survive the host being asleep. While the CDC is disconnected every line
+  used to be dropped, which is exactly the window the wake decision happens in;
+  the last `LOG_REPLAY_BYTES` of output are now kept in RAM and replayed, marked
+  `RPL|begin` … `RPL|end`, as soon as the host is back. `CFG_TUD_CDC_TX_BUFSIZE`
+  was raised so a full `STATUS` line (over 360 characters) is written in one
+  piece instead of being cut at the endpoint buffer.
+* The dismiss phase is bounded, because a key report is only delivered while the
+  host keeps this board's own port resumed and the host can resume through the
+  Arduino board instead. `WAKE_DISMISS_TIMEOUT_MS` caps the phase; on expiry the
+  firmware logs `ERR|WAKE|dismiss|stall` and starts the round anyway, so a
+  keyboard that cannot be delivered can never park the wake machine and cost a
+  shift. While this board's own bus is still suspended the same key is also sent
+  to the Arduino board (`WAKE_DISMISS_ARM_FALLBACK`,
+  `WAKE_DISMISS_ARM_COMMAND`), which is the board that certainly resumed, and
+  `tud_remote_wakeup()` is re-issued to ask for the port back. `STATUS` reports
+  the current phase as `wake-phase`.
+* `WAKE!<seconds>`, `WAKE!<seconds>!dry` and `WAKE!OFF` arm, arm-without-starting
+  or clear a one-shot deadline on demand, so the path can be exercised without
+  waiting for a real window. The `!dry` form wakes the host and then stops, which
+  is the safe first hardware test: no authored round starts while nobody is
+  watching the desktop. The next accepted clock sample replaces either form with
+  the authored schedule. `TIME!|HH:MM` stamps the wall clock once and re-arms from
+  the schedule the board read at boot, which is what lets a freshly flashed board
+  wake its first window with no host software involved.
+* A consumed test arm hands the deadline straight back to the authored windows.
+  `wake_scheduler_rearm()` runs where the deadline is consumed, so one `WAKE!` run
+  cannot leave the board unable to wake for the real window until some round
+  happens to run another shift check — a failure that writes no line at all,
+  because nothing is armed and nothing fires. A window already inside the lead
+  time is deliberately left unarmed, since `wake_scheduler_sync()` falls back to
+  "one minute from now" there and re-arming would become a wake loop. `WAKE!OFF`,
+  an exhausted attempt budget and a failed pulse all stay disarmed on purpose.
+
+### After a board reset
+
+The monotonic deadline itself cannot be persisted: a reset restarts the Pico
+clock and the board owns no battery-backed RTC. What is persisted in the
+calibration record (version 6) is the *decision* a reset cannot undo — the host
+was asleep, a wake was still owed, and how many recovery pulses were already
+spent:
+
+* On boot `wake_scheduler_recovery_needed()` decides whether the clock is really
+  lost. A host that is already awake cancels the recovery.
+* Otherwise the board sends one pulse that is not meant to start a round: it
+  brings the host up so the bridge can hand the wall clock back. The authored
+  deadline is then re-armed and the machine is free to sleep again until the real
+  window. After a brownout the machine may therefore wake once, early.
+* The attempt counter is persisted *before* the pulse and bounded by
+  `WAKE_RECOVERY_MAX_ATTEMPTS`, so a brownout loop can never become a wake storm.
+  The next accepted clock sample clears it.
+* A recovery boot cannot wait for USB enumeration — a port the host suspended
+  never mounts — so the mount wait is bounded by `WAKE_MOUNT_TIMEOUT_MS` and the
+  recovery then runs from the normal service loop over the private UART link.
+* The record is written only when the recovery decision changes, and never more
+  often than `WAKE_STORE_MIN_INTERVAL_MS`, because every write erases a 4 KiB
+  sector.
+
 ## Build one identity
 
 ```bash

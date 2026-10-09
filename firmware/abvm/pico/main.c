@@ -17,6 +17,7 @@
 #include "cycle_runtime.h"
 #include "game_buff_runtime.h"
 #include "shift_identity_runtime.h"
+#include "wake_scheduler.h"
 
 extern const uint8_t *abvm_program_data(void);
 extern size_t abvm_program_size(void);
@@ -27,6 +28,69 @@ extern size_t abvm_program_size(void);
 #define GAME_ROUTE_ID 8u
 #define WHISPER_ROUTE_ID 10u
 #define WHISPER_REPEAT_ROUTE_ID 12u
+/* Autonomous shift wake.  The Pico owns no RTC, so the bridge clock sample taken
+ * at each shift identity check is converted into a monotonic deadline.  A window
+ * start is therefore woken this many minutes early, and the machine is given a
+ * settle window before the authored Startup route starts driving the desktop. */
+#define WAKE_LEAD_MINUTES 2u
+#define WAKE_PULSE_COMMAND "MMOVE|1,0,rel,2"
+#define WAKE_PULSE_TIMEOUT_MS 5000u
+#define WAKE_RESUME_TIMEOUT_MS 60000u
+#define WAKE_SETTLE_MS 15000u
+/* The bridge re-announces its host-USB verdict every two seconds, so a single
+ * `UP` report can be that old.  The machine can also be a second away from
+ * suspending when the deadline lands, and reading that as "the host is already
+ * awake" silently eats the only wake of the window.  The shortcut is therefore
+ * taken only after the host has been reported awake for this long. */
+#define WAKE_HOST_AWAKE_GRACE_MS 5000u
+#define WAKE_MAX_ATTEMPTS 3u
+#define WAKE_RETRY_MS 300000u
+/* A verified wake leaves the host on the Windows lock screen, and the authored
+ * macro language has no click opcode at all (ABVM knows motion, keys and typing
+ * only), so nothing in the project can dismiss it.  Paced Enters clear the lock
+ * screen and sign the machine in without touching the pointer, which puts the
+ * authored round on the desktop instead of on a lock screen.  It only ever runs
+ * on a host this board actually woke.
+ *
+ * The phase is bounded on purpose.  A key report is only delivered while the
+ * host keeps this board's own port resumed, and the host can resume through the
+ * Arduino board instead, which leaves our endpoint unable to flush.  Waiting for
+ * that endpoint forever used to park the whole wake machine in this phase, so a
+ * later arm could never reach its pulse and the shift was lost.  Now the phase
+ * gives up after WAKE_DISMISS_TIMEOUT_MS and starts the round anyway, and while
+ * our own bus is suspended the board that certainly resumed presses the key. */
+#define WAKE_DISMISS_ENABLED 1
+#define WAKE_DISMISS_KEY 13u /* VK_RETURN */
+#define WAKE_DISMISS_PRESSES 3u
+#define WAKE_DISMISS_GAP_MS 1500u
+#define WAKE_DISMISS_TIMEOUT_MS 20000u
+#define WAKE_DISMISS_ARM_FALLBACK 1
+#define WAKE_DISMISS_ARM_COMMAND "KCOMBO|13,40,90"
+/* Two independent wake sources sit on the host bus: the Pico is itself a HID
+ * keyboard whose descriptor advertises remote wake-up, and the Arduino board
+ * raises RMWKUP from its own suspended mouse interface.  Both are armed by the
+ * host independently, so both are used in the same pulse; the tunables exist so
+ * a hardware bring-up can isolate one of them. */
+#define WAKE_USE_PICO_WAKEUP 1
+#define WAKE_USE_ARM_PULSE 1
+/* A board reset loses the RAM deadline.  The persisted record still says whether
+ * the host was asleep and whether a wake was owed, and that combination is
+ * enough to recover: one pulse brings the host back, the bridge re-sends the wall
+ * clock, and the real deadline is re-armed.  The attempt counter bounds this so a
+ * brownout loop can never turn into a wake storm. */
+#define WAKE_RECOVERY_MAX_ATTEMPTS 3u
+#define WAKE_RECOVERY_TIMEOUT_MS 120000u
+/* How long a recovery boot waits for the first host-USB sample before it stops
+ * asking and pulses anyway: the Arduino board re-announces its state every two
+ * seconds, so a silent link is itself the emergency. */
+#define WAKE_HOST_SAMPLE_TIMEOUT_MS 5000u
+/* How long a recovery boot waits for USB enumeration before falling through to
+ * the recovery pulse: an awake host mounts in milliseconds, a sleeping one never
+ * does until the pulse resumes it. */
+#define WAKE_MOUNT_TIMEOUT_MS 5000u
+/* The persisted record is written only when the recovery decision changes, and
+ * never more often than this, so a flapping USB state cannot burn the slot. */
+#define WAKE_STORE_MIN_INTERVAL_MS 30000u
 
 typedef struct Button { uint pin; bool raw, stable, long_sent, consumed; uint32_t changed_at, pressed_at; } Button;
 typedef enum ButtonEvent { BUTTON_NONE, BUTTON_DOWN, BUTTON_SHORT, BUTTON_LONG } ButtonEvent;
@@ -41,6 +105,28 @@ static ShiftIdentityRuntime shift_identity;
 static bool shift_checkpoint,shift_key_inflight,shift_launch_pending,shift_cue_started,shift_failure_paused;
 static uint8_t shift_lane;
 static uint32_t shift_generation,shift_cue_until;
+
+typedef enum WakePhase { WAKE_PHASE_IDLE=0, WAKE_PHASE_PULSE, WAKE_PHASE_RESUME, WAKE_PHASE_SETTLE, WAKE_PHASE_DISMISS } WakePhase;
+typedef enum WakeRecoveryPhase { WAKE_RECOVERY_IDLE=0, WAKE_RECOVERY_PULSE, WAKE_RECOVERY_WAIT } WakeRecoveryPhase;
+static WakeScheduler wake_scheduler;
+static WakePhase wake_phase;
+static WakeRecoveryPhase wake_recovery_phase;
+static bool wake_pulse_inflight;
+static bool wake_woke_host,wake_dismiss_done;
+static uint8_t wake_dismiss_step;
+static uint8_t wake_attempts;
+static uint32_t wake_deadline,wake_retry_at,wake_recovery_deadline,wake_dismiss_started;
+static bool wake_pulse_wait_logged;
+static uint32_t wake_host_awake_at;
+static bool wake_due_logged,wake_block_logged;
+static bool pico_usb_suspended,pico_remote_wakeup_en;
+static WakeStoreState wake_store_last;
+static uint32_t wake_store_next_at;
+static bool wake_store_dirty;
+static void wake_attempts_reset(void);
+static void wake_store_service(uint32_t now,bool force);
+static void print_wake_state(void);
+static void wake_report_blocked(const char *reason,uint32_t now);
 
 
 static Button pause_button = {.pin=BUTTON_PAUSE_PIN};
@@ -287,17 +373,74 @@ static void service_global_sound_listener(uint32_t now) {
     (void)arm_uart_sound_restart(now,1u,global_sound_threshold,
                                  global_sound_minimum,30000u);
 }
+/* While the host is asleep the CDC is disconnected and every log line would be
+ * thrown away, which is exactly the window an operator has to read afterwards:
+ * the wake decision, the pulse and its result all happen with nobody listening.
+ * The tail of the output is therefore kept in RAM and replayed, marked RPL|, the
+ * moment the host is back.  The buffer is bounded and only whole writes are
+ * replayed, so it can never grow or block. */
+#define LOG_REPLAY_BYTES 2048
+static char log_replay[LOG_REPLAY_BYTES];
+static size_t log_replay_used;
+
+static void log_replay_add(const char *text, size_t length) {
+    if (!length) return;
+    if (length >= LOG_REPLAY_BYTES) {
+        memcpy(log_replay, text + (length - LOG_REPLAY_BYTES), LOG_REPLAY_BYTES);
+        log_replay_used = LOG_REPLAY_BYTES;
+        return;
+    }
+    if (log_replay_used + length > LOG_REPLAY_BYTES) {
+        size_t drop = log_replay_used + length - LOG_REPLAY_BYTES;
+        memmove(log_replay, log_replay + drop, log_replay_used - drop);
+        log_replay_used -= drop;
+    }
+    memcpy(log_replay + log_replay_used, text, length);
+    log_replay_used += length;
+}
+
+static size_t cdc_write_all(const char *text, size_t length) {
+    size_t sent = 0u;
+    while (sent < length) {
+        uint32_t chunk = tud_cdc_write(text + sent, (uint32_t)(length - sent));
+        if (!chunk) break;
+        sent += chunk;
+    }
+    tud_cdc_write_flush();
+    return sent;
+}
+
 static int cdc_printf(const char *format, ...) {
     char output[384]; va_list args; va_start(args, format);
     int length = vsnprintf(output, sizeof(output), format, args); va_end(args);
-    if (length <= 0 || !tud_cdc_connected()) return length;
+    if (length <= 0) return length;
     size_t count = (size_t)length;
     if (count >= sizeof(output)) count = sizeof(output) - 1u;
-    tud_cdc_write(output, (uint32_t)count); tud_cdc_write_flush(); return length;
+    if (!tud_cdc_connected()) { log_replay_add(output, count); return length; }
+    if (log_replay_used) {
+        /* Chronological order: the held-back lines come first.  A host that is
+         * not draining yet keeps the remainder for the next call. */
+        static const char opening[] = "RPL|begin\n";
+        static const char closing[] = "RPL|end\n";
+        cdc_write_all(opening, sizeof(opening) - 1u);
+        size_t sent = cdc_write_all(log_replay, log_replay_used);
+        if (sent >= log_replay_used) log_replay_used = 0u;
+        else {
+            memmove(log_replay, log_replay + sent, log_replay_used - sent);
+            log_replay_used -= sent;
+        }
+        cdc_write_all(closing, sizeof(closing) - 1u);
+    }
+    (void)cdc_write_all(output, count);
+    return length;
 }
 #define printf cdc_printf
 static void print_status(void) {
-    printf("STATUS|state=%s|route=%u|lanes=%u|pc0=%lu|pc1=%lu|frames0=%u|frames1=%u|suspended=%u|hid-busy=%u|sound-active=%u|light-present=%u|light-watch=%u|light-cal=%u|guard=%u|guard-paused=%u|guard-profile=%s|guard-stage=%u|cycle=%u|time=%lu\n", abvm_status_name(vm.status), vm.route_id, vm.lane_count, (unsigned long)vm.lanes[0].pc, (unsigned long)vm.lanes[1].pc, vm.lanes[0].frame_count, vm.lanes[1].frame_count, vm.suspended.valid, hid_keyboard_busy() || arm_uart_mouse_busy(), arm_uart_sound_active(), light_sensor_present(), light_sensor_watch_active(), light_sensor_calibration_active(), guard_runtime_running(), guard_runtime_paused(), guard_runtime_profile_name(guard_runtime_active_profile()), guard_runtime_stage(), cycle_runtime_available(), (unsigned long)vm.now);
+    WakeStoreState wake_state;
+    uint16_t wall = 0u;
+    bool wall_known = wake_scheduler_wall_minute(&wake_scheduler, now_ms(), &wall);
+    if (!calibration_store_wake_get(&wake_state)) memset(&wake_state, 0, sizeof(wake_state));
+    printf("STATUS|state=%s|route=%u|lanes=%u|pc0=%lu|pc1=%lu|frames0=%u|frames1=%u|suspended=%u|hid-busy=%u|sound-active=%u|light-present=%u|light-watch=%u|light-cal=%u|guard=%u|guard-paused=%u|guard-profile=%s|guard-stage=%u|cycle=%u|time=%lu|pico-usb=%u|pico-rw=%u|wake=%u|wake-target=%02u:%02u|wake-synced=%u|wake-wall=%02u:%02u|wake-recovery=%u|wake-host=%u|wake-phase=%u\n", abvm_status_name(vm.status), vm.route_id, vm.lane_count, (unsigned long)vm.lanes[0].pc, (unsigned long)vm.lanes[1].pc, vm.lanes[0].frame_count, vm.lanes[1].frame_count, vm.suspended.valid, hid_keyboard_busy() || arm_uart_mouse_busy(), arm_uart_sound_active(), light_sensor_present(), light_sensor_watch_active(), light_sensor_calibration_active(), guard_runtime_running(), guard_runtime_paused(), guard_runtime_profile_name(guard_runtime_active_profile()), guard_runtime_stage(), cycle_runtime_available(), (unsigned long)vm.now, pico_usb_suspended ? 1u : 0u, pico_remote_wakeup_en ? 1u : 0u, wake_scheduler_armed(&wake_scheduler) ? 1u : 0u, wake_scheduler.next_start / 60u, wake_scheduler.next_start % 60u, wall_known ? 1u : 0u, wall / 60u, wall % 60u, (unsigned)wake_state.recovery_attempts, wake_state.host_asleep ? 1u : 0u, (unsigned)wake_phase);
 }
 static void print_light_calibration_dump(void) {
     uint32_t low[9],high[9];uint16_t mask=0u;
@@ -489,13 +632,106 @@ static void execute_command(char *line, uint32_t now) {
                 unsigned long b=strtoul(pair,&end,16);valid=end&&end-pair==2&&b<=255u;hash[i]=(uint8_t)b;
             }
         }
-        if(valid&&shift_checkpoint&&(with_clock?
-           shift_identity_reply_clock(&shift_identity,nonce,hash,minute,tud_cdc_connected()):
-           shift_identity_reply(&shift_identity,nonce,hash,tud_cdc_connected())))
-            printf("OK|SHIFT-ACCEPTED|%08lx\n",(unsigned long)nonce);
+        bool accepted=false;
+        if(valid&&shift_checkpoint) {
+            accepted=with_clock?
+                shift_identity_reply_clock(&shift_identity,nonce,hash,minute,tud_cdc_connected()):
+                shift_identity_reply(&shift_identity,nonce,hash,tud_cdc_connected());
+            /* A fresh clock sample is the only wall-clock reference the portable
+             * build ever gets; re-arm the autonomous wake deadline from it. */
+            if(accepted&&with_clock) {
+                wake_attempts_reset();
+                /* A fresh sample is the definition of "the clock is restored",
+                 * so it also retires any recovery budget spent while the board
+                 * was running without one. */
+                (void)calibration_store_wake_recovery_reset();
+                if(wake_scheduler_sync(&wake_scheduler,now,minute))
+                    printf("OK|WAKE|armed|window=%02u:%02u|in=%lu|lead=%u\n",
+                           wake_scheduler.next_start/60u,wake_scheduler.next_start%60u,
+                           (unsigned long)((wake_scheduler.deadline_ms-now)/60000u),
+                           wake_scheduler.lead_minutes);
+                else printf("EVT|WAKE|disarmed|reason=schedule-off\n");
+            }
+        }
+        if(accepted) printf("OK|SHIFT-ACCEPTED|%08lx\n",(unsigned long)nonce);
         else printf("ERR|SHIFT|invalid-or-unknown-user\n");
     }
     else if (!strcmp(line, "STATUS")) print_status();
+    else if (!strcmp(line, "WAKE?")) print_wake_state();
+    else if (!strncmp(line, "WAKE!", 5)) {
+        /* Operator hardware test: arm a one-shot deadline without waiting for a
+         * real window, so the wake path can be exercised on demand.  The `!dry`
+         * form wakes the host but starts no round, which is the safe first test.
+         * The next accepted bridge clock sample replaces it with the schedule. */
+        if (!strcmp(line + 5, "OFF")) {
+            wake_scheduler_disarm(&wake_scheduler); wake_attempts_reset();
+            wake_store_service(now, true);
+            printf("OK|WAKE|manual|disarmed\n");
+        } else {
+            char *argument = line + 5; bool dry = false;
+            char *bang = strchr(argument, '!');
+            if (bang) {
+                *bang = '\0';
+                if (!strcmp(bang + 1, "dry")) dry = true; else argument = NULL;
+            }
+            char *end = NULL;
+            unsigned long seconds = argument ? strtoul(argument, &end, 10) : 0ul;
+            if (!argument || !end || *end || !seconds || seconds > 86400ul)
+                printf("ERR|ARG|WAKE\n");
+            else if (!(dry ? wake_scheduler_arm_dry(&wake_scheduler, now, (uint32_t)seconds * 1000u)
+                           : wake_scheduler_arm_at(&wake_scheduler, now, (uint32_t)seconds * 1000u)))
+                printf("ERR|ARG|WAKE\n");
+            else {
+                /* A fresh arm always starts from a clean phase machine, so a
+                 * stale phase can never swallow the new deadline. */
+                wake_phase=WAKE_PHASE_IDLE;wake_pulse_inflight=false;
+                wake_woke_host=false;wake_dismiss_done=false;
+                wake_dismiss_step=0u;wake_dismiss_started=0u;
+                wake_host_awake_at=0u;wake_due_logged=false;wake_block_logged=false;
+                wake_retry_at=now;
+                wake_attempts_reset();
+                wake_store_service(now, true);
+                printf("OK|WAKE|manual|in=%lu|target=%02u:%02u|dry=%u\n", seconds,
+                       wake_scheduler.next_start / 60u, wake_scheduler.next_start % 60u,
+                       dry ? 1u : 0u);
+            }
+        }
+    }
+    else if (!strncmp(line, "TIME!", 5)) {
+        /* A board that has never completed a shift check owns no wall clock at
+         * all, so the authored schedule cannot arm and the first autonomous wake
+         * of a window is impossible.  This one-shot stamp hands the board a
+         * clock with no host software involved: the operator runs it once, or the
+         * kitchen sends it right after flashing, and the board keeps time from
+         * there.  The schedule itself now comes from the flashed program. */
+        char *argument = line + 5;
+        if (*argument == '|') ++argument;
+        char *end = NULL;
+        unsigned long hour = strtoul(argument, &end, 10);
+        unsigned long minute = 0ul;
+        bool valid = end && *end == ':' && hour < 24ul;
+        if (valid) {
+            char *minutes = end + 1;
+            minute = strtoul(minutes, &end, 10);
+            valid = end && !*end && (size_t)(end - minutes) <= 2u && minute < 60ul;
+        }
+        if (!valid) printf("ERR|ARG|TIME\n");
+        else {
+            wake_attempts_reset();
+            (void)calibration_store_wake_recovery_reset();
+            bool armed = wake_scheduler_sync(&wake_scheduler, now,
+                                             (uint16_t)(hour * 60ul + minute));
+            if (armed)
+                printf("OK|TIME|set=%02lu:%02lu|window=%02u:%02u|in=%lu|lead=%u\n",
+                       hour, minute, wake_scheduler.next_start / 60u,
+                       wake_scheduler.next_start % 60u,
+                       (unsigned long)((wake_scheduler.deadline_ms - now) / 60000u),
+                       wake_scheduler.lead_minutes);
+            else
+                printf("OK|TIME|set=%02lu:%02lu|armed=0|schedule=%u\n",
+                       hour, minute, wake_scheduler.enabled ? 1u : 0u);
+        }
+    }
     else if (!strcmp(line, "LUX?")) {
         uint32_t lux, age;
         if (light_sensor_latest(&lux, &age, now))
@@ -889,8 +1125,10 @@ static void service_light(uint32_t now) {
 static void service_mouse(uint32_t now) {
     uint8_t completed_lane;
     if (arm_uart_mouse_service(now, &completed_lane)) {
-        if(arm_uart_mouse_internal_completion(completed_lane))
+        if(arm_uart_mouse_internal_completion(completed_lane)) {
             ambient_mouse_complete(now);
+            wake_pulse_inflight=false;
+        }
         else if((vm.status == ABVM_STATUS_RUNNING ||
                  vm.status == ABVM_STATUS_PAUSED) &&
                 !abvm_complete_action(&vm, completed_lane, now))
@@ -998,6 +1236,19 @@ static const char *cycle_host_name(uint8_t state) {
     if(state==ARM_HOST_USB_SUSPEND)return "SUSPEND";
     if(state==ARM_HOST_USB_DOWN)return "DOWN";
     return "UNKNOWN";
+}
+/* Everything the wake decision reads, in one reply, so an operator can see why
+ * a deadline is still pending instead of inferring it from STATUS fields. */
+static void print_wake_state(void) {
+    bool armed=wake_scheduler_armed(&wake_scheduler);
+    long due_ms=armed?(long)(int32_t)(wake_scheduler.deadline_ms-now_ms()):0l;
+    printf("OK|WAKE|armed=%u|manual=%u|dry=%u|synced=%u|schedule=%u|target=%02u:%02u|due-ms=%ld|attempts=%u|phase=%u|recovery=%u|host=%s|pico-usb=%u|pico-rw=%u\n",
+           armed?1u:0u,wake_scheduler.manual?1u:0u,wake_scheduler.dry?1u:0u,
+           wake_scheduler.synced?1u:0u,wake_scheduler.enabled?1u:0u,
+           wake_scheduler.next_start/60u,wake_scheduler.next_start%60u,due_ms,
+           (unsigned)wake_attempts,(unsigned)wake_phase,(unsigned)wake_recovery_phase,
+           cycle_host_name(arm_uart_host_usb_state()),
+           pico_usb_suspended?1u:0u,pico_remote_wakeup_en?1u:0u);
 }
 static void service_cycle_events(void) {
     CycleEvent event;
@@ -1271,6 +1522,9 @@ static void service_vm(uint32_t now) {
                     printf("ERR|SHIFT|invalid-descriptor\n");abvm_stop(&vm,now);break;
                 }
                 shift_lane=event.lane;shift_checkpoint=true;
+                wake_scheduler_configure(&wake_scheduler,shift_identity.schedule_enabled,
+                                         shift_identity.day_start,shift_identity.day_end,
+                                         shift_identity.night_start,shift_identity.night_end);
                 shift_generation=vm.route_generation;launch_shift_check(now);break;
             }
             if(event.opcode==ABVM_OP_SHIFT_TYPE)event.opcode=ABVM_OP_TYPE;
@@ -1367,9 +1621,397 @@ static void service_vm(uint32_t now) {
         default: break;
     }
 }
-void tud_umount_cb(void) { shift_identity_forget(&shift_identity);hid_keyboard_set_shift(0u); release_all_actors(now_ms()); buzzer_silence(); }
+/* Hostless shift wake.  Runs only while no round is active: a running macro is
+ * already driving HID traffic, which keeps the host awake by itself.  The
+ * Arduino board reports the host's USB suspend state on the private UART link,
+ * so a wake is verified instead of assumed. */
+static void wake_attempts_reset(void) {
+    wake_attempts=0u;wake_retry_at=0u;
+}
+/* The host is asleep when the Arduino board reports the bus suspended.  Until
+ * that first sample arrives, the Pico's own suspend flag is the only evidence,
+ * and the Arduino board re-announces its state every two seconds. */
+static bool wake_host_asleep(void) {
+    if(arm_uart_host_usb_seen()) return arm_uart_host_usb_state()==ARM_HOST_USB_SUSPEND;
+    return pico_usb_suspended;
+}
+static bool wake_host_up(void) { return arm_uart_host_usb_state()==ARM_HOST_USB_UP; }
+static const char *wake_clock_text(char *buffer,size_t capacity) {
+    uint16_t minute=0u;
+    if(!wake_scheduler_wall_minute(&wake_scheduler,now_ms(),&minute)) return "unknown";
+    snprintf(buffer,capacity,"%02u:%02u",minute/60u,minute%60u);
+    return buffer;
+}
+/* Only the recovery decision is persisted, and only when it changes: a sector
+ * erase per loop iteration would wear the slot out in days. */
+static WakeStoreState wake_store_snapshot(void) {
+    WakeStoreState state;
+    if(!calibration_store_wake_get(&state)) memset(&state,0,sizeof(state));
+    state.host_asleep=wake_host_asleep();
+    state.pending=wake_scheduler_armed(&wake_scheduler)||wake_recovery_phase!=WAKE_RECOVERY_IDLE;
+    state.next_start=wake_scheduler.next_start;
+    return state;
+}
+static void wake_store_service(uint32_t now,bool force) {
+    WakeStoreState state=wake_store_snapshot();
+    bool changed=state.host_asleep!=wake_store_last.host_asleep||
+                 state.pending!=wake_store_last.pending||
+                 state.recovery_attempts!=wake_store_last.recovery_attempts||
+                 state.next_start!=wake_store_last.next_start;
+    if(!changed&&!wake_store_dirty) return;
+    if(!force&&(int32_t)(now-wake_store_next_at)<0) { wake_store_dirty=true; return; }
+    if(!calibration_store_wake_set(&state)) { wake_store_dirty=true; return; }
+    wake_store_last=state;wake_store_dirty=false;
+    wake_store_next_at=now+WAKE_STORE_MIN_INTERVAL_MS;
+}
+static bool wake_pulse_pico(void) {
+#if WAKE_USE_PICO_WAKEUP
+    /* TinyUSB only drives resume when the host armed DEVICE_REMOTE_WAKEUP, and
+     * driving it on an unsuspended bus would be a protocol violation. */
+    if(!pico_usb_suspended||!pico_remote_wakeup_en) return false;
+    return tud_remote_wakeup();
+#else
+    return false;
+#endif
+}
+static ArmMouseSubmit wake_pulse_arm(uint32_t now) {
+#if WAKE_USE_ARM_PULSE
+    return arm_uart_mouse_submit_internal(WAKE_PULSE_COMMAND,now);
+#else
+    (void)now;return ARM_MOUSE_UNSUPPORTED;
+#endif
+}
+static void wake_report_pulse(uint8_t attempt,bool pico,ArmMouseSubmit arm_result) {
+    char clock[16];
+    printf("EVT|WAKE|state=pulse|attempt=%u|wall=%s|target=%02u:%02u|lead=%u|pico-rw=%u|arm=%u|usb=%u\n",
+           (unsigned)attempt,wake_clock_text(clock,sizeof(clock)),
+           wake_scheduler.next_start/60u,wake_scheduler.next_start%60u,
+           wake_scheduler.lead_minutes,pico?1u:0u,
+           arm_result==ARM_MOUSE_ACCEPTED?1u:0u,(unsigned)arm_uart_host_usb_state());
+}
+/* After a board reset the monotonic deadline is gone, but the persisted record
+ * still says the host was asleep with a wake owed.  The only route back to a wall
+ * clock is to bring the host up once: the bridge then re-sends the sample, the
+ * authored deadline is re-armed, and the machine is free to sleep again until the
+ * real window.  The pulse is bounded by a persisted attempt counter so a brownout
+ * loop can never become a wake storm, and an already-awake host cancels it. */
+/* A pending deadline that nothing can fire is the one failure an operator cannot
+ * see, because it writes no line at all.  Every blocker therefore names itself
+ * once per deadline, with the state it was blocked in. */
+static void wake_report_blocked(const char *reason,uint32_t now) {
+    if(wake_block_logged) return;
+    if(!wake_scheduler_armed(&wake_scheduler)||!wake_scheduler_due(&wake_scheduler,now)) return;
+    wake_block_logged=true;
+    printf("ERR|WAKE|blocked|reason=%s|state=%s|phase=%u|recovery=%u\n",
+           reason,abvm_status_name(vm.status),(unsigned)wake_phase,
+           (unsigned)wake_recovery_phase);
+}
+static void service_wake_recovery(uint32_t now) {
+    if(wake_recovery_phase==WAKE_RECOVERY_PULSE) {
+        if(!arm_uart_host_usb_seen()&&!pico_usb_suspended&&
+           (int32_t)(now-wake_recovery_deadline)<0) return;
+        if(wake_host_up()) {
+            wake_recovery_phase=WAKE_RECOVERY_IDLE;
+            printf("EVT|WAKE|recovery|skipped|reason=host-up\n");
+            return;
+        }
+        if(calibration_runtime_active()) return;
+        if(!arm_uart_mouse_ready()||arm_uart_mouse_busy()) {
+            /* The normal wake path is blocked while the recovery runs, so a
+             * board that cannot be reached must not hold the phase: give up
+             * after the deadline instead of parking the wake machine. */
+            if((int32_t)(now-wake_recovery_deadline)<0) return;
+            wake_recovery_phase=WAKE_RECOVERY_IDLE;
+            printf("ERR|WAKE|recovery|skipped|reason=arm|ready=%u|busy=%u\n",
+                   arm_uart_mouse_ready()?1u:0u,arm_uart_mouse_busy()?1u:0u);
+            return;
+        }
+        WakeStoreState state;
+        if(!calibration_store_wake_get(&state)) {
+            wake_recovery_phase=WAKE_RECOVERY_IDLE;
+            printf("ERR|WAKE|recovery|skipped|reason=store\n");
+            return;
+        }
+        if(!wake_scheduler_recovery_needed(state.host_asleep,state.pending,
+                                           state.recovery_attempts,WAKE_RECOVERY_MAX_ATTEMPTS)) {
+            wake_recovery_phase=WAKE_RECOVERY_IDLE;
+            printf("EVT|WAKE|recovery|skipped|reason=limit|attempts=%u\n",
+                   (unsigned)state.recovery_attempts);
+            return;
+        }
+        state.recovery_attempts=(uint8_t)(state.recovery_attempts+1u);
+        if(!calibration_store_wake_set(&state)) {
+            wake_recovery_phase=WAKE_RECOVERY_IDLE;
+            printf("ERR|WAKE|recovery|store\n");
+            return;
+        }
+        wake_store_last=state;wake_store_dirty=false;
+        wake_store_next_at=now+WAKE_STORE_MIN_INTERVAL_MS;
+        bool pico=wake_pulse_pico();
+        ArmMouseSubmit arm_result=wake_pulse_arm(now);
+        wake_recovery_phase=WAKE_RECOVERY_WAIT;
+        wake_recovery_deadline=now+WAKE_RECOVERY_TIMEOUT_MS;
+        char clock[16];
+        printf("EVT|WAKE|recovery=pulse|attempt=%u|target=%02u:%02u|pico-rw=%u|arm=%u|usb=%u|wall=%s\n",
+               (unsigned)state.recovery_attempts,
+               state.next_start/60u,state.next_start%60u,pico?1u:0u,
+               arm_result==ARM_MOUSE_ACCEPTED?1u:0u,
+               (unsigned)arm_uart_host_usb_state(),wake_clock_text(clock,sizeof(clock)));
+        if(!pico&&arm_result!=ARM_MOUSE_ACCEPTED)
+            printf("ERR|WAKE|recovery=no-pulse|reason=%u\n",(unsigned)arm_result);
+        return;
+    }
+    if(wake_recovery_phase==WAKE_RECOVERY_WAIT) {
+        if(wake_host_up()) {
+            wake_recovery_phase=WAKE_RECOVERY_IDLE;
+            printf("EVT|WAKE|recovery=host-up|settled\n");
+            return;
+        }
+        if((int32_t)(now-wake_recovery_deadline)<0) return;
+        wake_recovery_phase=WAKE_RECOVERY_IDLE;
+        buzzer_play(BUZZER_CUE_ERROR,now);
+        printf("ERR|WAKE|recovery=no-resume|usb=%u\n",(unsigned)arm_uart_host_usb_state());
+    }
+}
+static void service_wake(uint32_t now) {
+    /* Recovery owns the wake path while it runs: the host is asleep and there is
+     * no clock sample to re-arm from until the pulse brings the bridge back.  A
+     * deadline that expires inside that window fires nothing at all, so say so
+     * once, or a blocked wake is indistinguishable from a broken one. */
+    if(wake_recovery_phase!=WAKE_RECOVERY_IDLE) {
+        wake_report_blocked("recovery",now);
+        service_wake_recovery(now);
+        return;
+    }
+    /* Only a round that is actually driving the host competes with the wake: a
+     * running or paused round keeps the machine awake by itself.  Every other
+     * state must let the wake through, including `ABVM_STATUS_IDLE`, which is
+     * what a freshly booted board sits in.  Gating on `STOPPED` silently disabled
+     * the whole wake path after every flash until an operator pressed start/stop
+     * once -- the wake fired no pulse and wrote no line, which is exactly how it
+     * behaved in the field. */
+    if(vm.status==ABVM_STATUS_RUNNING||vm.status==ABVM_STATUS_PAUSED) {
+        wake_phase=WAKE_PHASE_IDLE;wake_pulse_inflight=false;
+        wake_woke_host=false;wake_dismiss_done=false;wake_dismiss_step=0u;wake_dismiss_started=0u;
+        wake_report_blocked("round",now);
+        return;
+    }
+    if(wake_phase==WAKE_PHASE_PULSE) {
+        if(wake_pulse_inflight&&(int32_t)(now-wake_deadline)<0)return;
+        wake_pulse_inflight=false;wake_phase=WAKE_PHASE_RESUME;
+        wake_deadline=now+WAKE_RESUME_TIMEOUT_MS;
+        printf("EVT|WAKE|state=resume|wait-ms=%u\n",(unsigned)WAKE_RESUME_TIMEOUT_MS);
+        return;
+    }
+    if(wake_phase==WAKE_PHASE_RESUME) {
+        if(arm_uart_host_usb_state()==ARM_HOST_USB_UP) {
+            wake_phase=WAKE_PHASE_SETTLE;wake_deadline=now+WAKE_SETTLE_MS;
+            printf("EVT|WAKE|state=host-up|settle-ms=%u\n",(unsigned)WAKE_SETTLE_MS);
+            return;
+        }
+        if((int32_t)(now-wake_deadline)<0)return;
+        ++wake_attempts;
+        wake_phase=WAKE_PHASE_IDLE;
+        wake_retry_at=now+WAKE_RETRY_MS;
+        buzzer_play(BUZZER_CUE_ERROR,now);
+        printf("ERR|WAKE|no-resume|attempt=%u|usb=%u|retry-ms=%u\n",
+               wake_attempts,(unsigned)arm_uart_host_usb_state(),(unsigned)WAKE_RETRY_MS);
+        return;
+    }
+    if(wake_phase==WAKE_PHASE_SETTLE) {
+        if((int32_t)(now-wake_deadline)<0)return;
+#if WAKE_DISMISS_ENABLED
+        /* The machine resumed on its lock screen; clear it before the authored
+         * round takes over.  Only for a host this board actually woke. */
+        if(wake_woke_host&&!wake_dismiss_done) {
+            wake_phase=WAKE_PHASE_DISMISS;wake_dismiss_step=0u;wake_deadline=now;
+            wake_dismiss_started=now;
+            return;
+        }
+#endif
+        wake_phase=WAKE_PHASE_IDLE;
+        bool dry=wake_scheduler.dry;
+        wake_scheduler_disarm(&wake_scheduler);
+        /* A test arm is a test, not a schedule.  Give the deadline straight back
+         * to the authored windows so one WAKE! run cannot leave the board unable
+         * to wake for the real window.  A re-arm that does not happen must name
+         * itself: a board left with no deadline writes no line at all, and that
+         * silence is indistinguishable from a broken wake path. */
+        if(wake_scheduler_rearm(&wake_scheduler,now))
+            printf("EVT|WAKE|rearmed|window=%02u:%02u|in=%lu\n",
+                   wake_scheduler.next_start/60u,wake_scheduler.next_start%60u,
+                   (unsigned long)((wake_scheduler.deadline_ms-now)/60000u));
+        else {
+            char clock[16];
+            const char *reason=!wake_scheduler.enabled?"schedule-off":
+                               !wake_scheduler.synced?"no-clock":"inside-lead";
+            printf("EVT|WAKE|rearm|skipped|reason=%s|lead=%u|wall=%s\n",
+                   reason,wake_scheduler.lead_minutes,
+                   wake_clock_text(clock,sizeof(clock)));
+        }
+        ++wake_attempts;
+        if(dry) {
+            /* WAKE!<seconds>!dry proves the resume and stops there: no authored
+             * round may start while nobody is watching the desktop. */
+            printf("EVT|WAKE|state=start|attempt=%u|skipped=manual-dry\n",wake_attempts);
+            return;
+        }
+        printf("EVT|WAKE|state=start|attempt=%u\n",wake_attempts);
+        start_control(now);
+        if(!guard_runtime_running()&&vm.status!=ABVM_STATUS_RUNNING) {
+            wake_retry_at=now+WAKE_RETRY_MS;
+            printf("ERR|WAKE|start|retry-ms=%u\n",(unsigned)WAKE_RETRY_MS);
+        }
+        return;
+    }
+#if WAKE_DISMISS_ENABLED
+    /* Paced Enter presses, each fire-and-forget with a fixed gap: the first
+     * drops the lock screen, the next ones sign the machine in.  The phase can
+     * never block the shift: it gives up after WAKE_DISMISS_TIMEOUT_MS, and a
+     * refusal is logged and the sequence moves on. */
+    if(wake_phase==WAKE_PHASE_DISMISS) {
+        if((int32_t)(now-wake_deadline)<0)return;
+        if((int32_t)(now-wake_dismiss_started-WAKE_DISMISS_TIMEOUT_MS)>=0) {
+            printf("ERR|WAKE|dismiss|stall|step=%u|usb=%u\n",
+                   (unsigned)wake_dismiss_step,pico_usb_suspended?1u:0u);
+            wake_dismiss_step=WAKE_DISMISS_PRESSES;
+        }
+        if(wake_dismiss_step<WAKE_DISMISS_PRESSES) {
+            HidKeyboardSubmit key=hid_keyboard_submit_trigger(WAKE_DISMISS_KEY,40u,90u,now);
+            if(key==HID_KEYBOARD_BUSY) {
+                /* Our own report is only held up while the host keeps this port
+                 * suspended, which happens when it resumed through the Arduino
+                 * board.  Ask for our port back, and let the board that
+                 * certainly resumed press the key in the meantime. */
+                if(!pico_usb_suspended) return;
+                (void)wake_pulse_pico();
+#if WAKE_DISMISS_ARM_FALLBACK
+                if(!arm_uart_mouse_ready()||arm_uart_mouse_busy()) return;
+                ArmMouseSubmit arm=arm_uart_mouse_submit_internal(WAKE_DISMISS_ARM_COMMAND,now);
+                if(arm==ARM_MOUSE_BUSY) return;
+                if(arm==ARM_MOUSE_ACCEPTED) {
+                    printf("EVT|WAKE|state=dismiss|step=enter|n=%u|via=arm\n",
+                           (unsigned)(wake_dismiss_step+1u));
+                    wake_dismiss_step++;
+                } else {
+                    printf("ERR|WAKE|dismiss|arm=%u|n=%u\n",
+                           (unsigned)arm,(unsigned)(wake_dismiss_step+1u));
+                }
+                wake_deadline=now+WAKE_DISMISS_GAP_MS;
+#endif
+                return;
+            }
+            if(key==HID_KEYBOARD_ACCEPTED)
+                printf("EVT|WAKE|state=dismiss|step=enter|n=%u\n",(unsigned)(wake_dismiss_step+1u));
+            else
+                printf("ERR|WAKE|dismiss|key=%u|n=%u\n",
+                       (unsigned)key,(unsigned)(wake_dismiss_step+1u));
+            wake_dismiss_step++;
+            wake_deadline=now+WAKE_DISMISS_GAP_MS;
+            return;
+        }
+        wake_dismiss_step=0u;wake_dismiss_done=true;
+        wake_phase=WAKE_PHASE_SETTLE;wake_deadline=now;
+        return;
+    }
+#endif
+    if(!wake_scheduler_armed(&wake_scheduler)||
+       !wake_scheduler_due(&wake_scheduler,now)) { wake_block_logged=false; return; }
+    if((int32_t)(now-wake_retry_at)<0) return;
+    if(wake_attempts>=WAKE_MAX_ATTEMPTS) {
+        wake_scheduler_disarm(&wake_scheduler);
+        printf("ERR|WAKE|attempt-limit|attempts=%u\n",wake_attempts);
+        return;
+    }
+    if(!wake_due_logged) {
+        /* One line per deadline, naming every input the decision used, so a wake
+         * that never left the board explains itself in the log. */
+        wake_due_logged=true;
+        printf("EVT|WAKE|due|manual=%u|dry=%u|attempts=%u|usb=%s|pico-usb=%u|pico-rw=%u\n",
+               wake_scheduler.manual?1u:0u,wake_scheduler.dry?1u:0u,(unsigned)wake_attempts,
+               cycle_host_name(arm_uart_host_usb_state()),
+               pico_usb_suspended?1u:0u,pico_remote_wakeup_en?1u:0u);
+    }
+    if(calibration_runtime_active()) { wake_report_blocked("calibration",now); return; }
+    if(arm_uart_host_usb_state()==ARM_HOST_USB_UP) {
+        /* The host is already awake: start the authored round without a pulse and
+         * without a lock-screen dismiss, because there is no lock screen to clear
+         * and a stray click would land on whatever the operator is using.  That
+         * verdict is a report and not a measurement, though, so confirm it over a
+         * grace window that outlasts one report period: a machine that suspends
+         * right at the deadline still gets its pulse. */
+        if(!wake_host_awake_at) {
+            wake_host_awake_at=now;
+            printf("EVT|WAKE|due|host=up|confirm-ms=%u|pico-usb=%u\n",
+                   (unsigned)WAKE_HOST_AWAKE_GRACE_MS,pico_usb_suspended?1u:0u);
+            return;
+        }
+        if((int32_t)(now-wake_host_awake_at)<(int32_t)WAKE_HOST_AWAKE_GRACE_MS) return;
+        wake_host_awake_at=0u;
+        wake_woke_host=false;wake_dismiss_done=false;wake_dismiss_step=0u;wake_dismiss_started=0u;
+        wake_phase=WAKE_PHASE_SETTLE;wake_deadline=now+WAKE_SETTLE_MS;
+        printf("EVT|WAKE|state=host-awake|settle-ms=%u\n",(unsigned)WAKE_SETTLE_MS);
+        return;
+    }
+    wake_host_awake_at=0u;
+    /* Both wake sources are fired in the same pulse: they are armed by the host
+     * independently, so whichever one Windows accepted is the one that resumes
+     * the machine, and no latency is spent discovering which.  Neither source
+     * may be gated on the other: the Pico resumes the host bus from its own
+     * suspended port and needs nothing from the Arduino board, so an unprobed,
+     * busy or faulted board must never be able to stop the machine from being
+     * woken -- silently, which is how it used to behave. */
+    bool pico=wake_pulse_pico();
+    ArmMouseSubmit result=ARM_MOUSE_UNSUPPORTED;
+    if(arm_uart_mouse_ready()&&!arm_uart_mouse_busy()) {
+        result=wake_pulse_arm(now);
+        if(!pico&&result==ARM_MOUSE_ACCEPTED)
+            printf("ERR|WAKE|pulse|pico-skipped|usb=%u|rw=%u\n",
+                   pico_usb_suspended?1u:0u,pico_remote_wakeup_en?1u:0u);
+    } else if(!pico) {
+        /* Nothing can go out yet.  Say why once, then keep trying: the deadline
+         * stays due until a pulse actually leaves. */
+        if(!wake_pulse_wait_logged) {
+            wake_pulse_wait_logged=true;
+            printf("ERR|WAKE|pulse|wait|arm-ready=%u|arm-busy=%u|pico-usb=%u|pico-rw=%u\n",
+                   arm_uart_mouse_ready()?1u:0u,arm_uart_mouse_busy()?1u:0u,
+                   pico_usb_suspended?1u:0u,pico_remote_wakeup_en?1u:0u);
+        }
+        return;
+    } else {
+        printf("ERR|WAKE|pulse|arm-skipped|ready=%u|busy=%u\n",
+               arm_uart_mouse_ready()?1u:0u,arm_uart_mouse_busy()?1u:0u);
+    }
+    if(pico||result==ARM_MOUSE_ACCEPTED) {
+        /* The Pico's own resume carries no acknowledgement, so the phase machine
+         * only waits on the Arduino round trip when that path was used. */
+        wake_pulse_wait_logged=false;
+        wake_due_logged=false;wake_block_logged=false;
+        wake_pulse_inflight=result==ARM_MOUSE_ACCEPTED;
+        wake_woke_host=true;wake_dismiss_done=false;wake_dismiss_step=0u;
+        wake_phase=WAKE_PHASE_PULSE;
+        wake_deadline=now+WAKE_PULSE_TIMEOUT_MS;
+        wake_report_pulse((uint8_t)(wake_attempts+1u),pico,result);
+    } else if(result!=ARM_MOUSE_BUSY) {
+        wake_scheduler_disarm(&wake_scheduler);
+        printf("ERR|WAKE|pulse|reason=%u\n",(unsigned)result);
+    }
+}
+void tud_umount_cb(void) {
+    pico_usb_suspended=false;pico_remote_wakeup_en=false;
+    shift_identity_forget(&shift_identity);hid_keyboard_set_shift(0u); release_all_actors(now_ms()); buzzer_silence();
+}
 void tud_suspend_cb(bool remote_wakeup_en) {
-    (void)remote_wakeup_en; release_all_actors(now_ms()); buzzer_silence();
+    pico_usb_suspended=true;pico_remote_wakeup_en=remote_wakeup_en;
+    release_all_actors(now_ms()); buzzer_silence();
+    /* `remote_wakeup_en` is the host's answer to SET_FEATURE(DEVICE_REMOTE_WAKEUP)
+     * and it survives the resume, so STATUS reports the verdict an operator needs
+     * before trusting the Pico-side wake path on this machine. */
+    printf("EVT|USB|suspend|remote-wakeup=%u\n",remote_wakeup_en?1u:0u);
+}
+void tud_resume_cb(void) {
+    pico_usb_suspended=false;
+    printf("EVT|USB|resume|remote-wakeup=%u\n",pico_remote_wakeup_en?1u:0u);
 }
 static void configure_buzzer_cues(void){
     for(uint8_t cue_id=1u;cue_id<=23u;++cue_id){
@@ -1388,21 +2030,73 @@ int main(void) {
     bool program_verified = abvm_init(&vm, program, program_size);
     bool guard_available = program_verified && guard_runtime_init(&vm);
     if(guard_available)configure_buzzer_cues();
+    bool schedule_from_program = false;
     if (program_verified) {
         calibration_runtime_init(&vm);
         (void)cycle_runtime_init(&vm,now_ms());
         load_whisper_profile();
         ambient_mouse_init(now_ms());
+        wake_scheduler_init(&wake_scheduler,WAKE_LEAD_MINUTES);
+        /* The authored shift schedule travels inside the flashed program, so the
+         * board can learn its windows at boot instead of waiting for a round to
+         * reach its shift check.  Without this the board only ever learns the
+         * schedule from a check it is supposed to trigger itself, which leaves a
+         * freshly flashed board unable to arm the first window it must wake. */
+        {
+            const uint8_t *shift_payload;uint32_t shift_size;uint16_t shift_id;
+            if(abvm_find_constant(&vm,ABVM_CONST_SHIFT,&shift_id,&shift_payload,&shift_size)&&
+               shift_identity_load(&shift_identity,shift_payload,shift_size,
+                                   now_ms()^local_u32(vm.header.program_sha256))) {
+                wake_scheduler_configure(&wake_scheduler,shift_identity.schedule_enabled,
+                                         shift_identity.day_start,shift_identity.day_end,
+                                         shift_identity.night_start,shift_identity.night_end);
+                schedule_from_program=true;
+            }
+        }
+        /* A board reset loses the RAM deadline but not the decision behind it:
+         * the persisted record still knows whether the host was asleep with a
+         * wake owed, and that is enough to recover the clock. */
+        (void)calibration_store_wake_get(&wake_store_last);
+        if(wake_scheduler_recovery_needed(wake_store_last.host_asleep,
+                                          wake_store_last.pending,
+                                          wake_store_last.recovery_attempts,
+                                          WAKE_RECOVERY_MAX_ATTEMPTS)) {
+            wake_recovery_phase=WAKE_RECOVERY_PULSE;
+            wake_recovery_deadline=now_ms()+WAKE_HOST_SAMPLE_TIMEOUT_MS;
+        }
     }
     /* Do not expose a half-ready USB device while a large patched ABP image is
      * being hashed and structurally verified. Attach only after boot work. */
     tusb_init();
-    while (!tud_mounted()) { tud_task(); sleep_ms(1); }
+    /* A board that reset while the host was asleep can never finish enumerating:
+     * the port stays suspended until something resumes it, so an unbounded wait
+     * would hang the recovery pulse forever.  An awake host still enumerates in
+     * milliseconds and keeps the full boot banner. */
+    uint32_t mount_started=now_ms();
+    while (!tud_mounted()) {
+        tud_task(); sleep_ms(1);
+        if (wake_recovery_phase!=WAKE_RECOVERY_IDLE&&
+            (int32_t)(now_ms()-(mount_started+WAKE_MOUNT_TIMEOUT_MS))>=0) break;
+    }
     if (!arm_uart_mouse_probe(now_ms())) arm_fault_reported = true;
     if (!program_verified) {
         while (true) { tud_task(); printf("ERR|ABVM|boot-verify|reason=%s\n", vm.fault ? vm.fault : "unknown"); sleep_ms(1000); }
     }
     printf("BOOT|ABVM|format=%u|abi=%u|bytes=%lu|state-bytes=%lu|frames=%u|lanes=%u|interrupts=%u|hid=keyboard+type+arm-rmouse|light=bh1750|guard=%u|cycle=%u|buzzer=legacy-calibration-gp6\n", ABVM_FORMAT_VERSION, ABVM_VM_ABI, (unsigned long)program_size, (unsigned long)sizeof(vm), vm.resources.max_frames, vm.resources.max_lanes, vm.resources.max_interrupts, guard_available, cycle_runtime_available());
-    printf("READY|keys=GP3-pause-long-soundcal,GP4-guard-long-lightcal|arm=UART0-GP16-GP17-57600|buzzer=GP6-legacy-calibration-nonblocking|cdc=PING,STATUS,SETRES,WSND,BEEP,BEEPSEQ,LUX?,LCAL-ms,SCAL-ms,GUARD-ON-OFF,PAUSE,RESUME,WHISPER,WHISPER-REPEAT,SOUND-id\n");
-    while (true) { uint32_t now = now_ms(); tud_task(); service_cdc(now); service_buttons(now); service_keyboard(now); service_mouse(now); service_cycle(now); guard_runtime_set_input_locked(input_lock_active()); service_light(now); service_buzzer_action(now); service_shift_check(now); service_game_buffs(now); service_vm(now); service_ambient_mouse(now); service_pending_sound_whisper(now); service_global_sound_listener(now); buzzer_service(now); sleep_ms(1); }
+    printf("READY|keys=GP3-pause-long-soundcal,GP4-guard-long-lightcal|arm=UART0-GP16-GP17-57600|buzzer=GP6-legacy-calibration-nonblocking|cdc=PING,STATUS,SETRES,WSND,BEEP,BEEPSEQ,LUX?,LCAL-ms,SCAL-ms,GUARD-ON-OFF,PAUSE,RESUME,WHISPER,WHISPER-REPEAT,SOUND-id,TIME!HH:MM,WAKE!s-WAKE!s!dry-WAKE!OFF,WAKE?\n");
+    if(schedule_from_program)
+        printf("EVT|WAKE|schedule|source=program|enabled=%u|day=%02u:%02u-%02u:%02u|night=%02u:%02u-%02u:%02u|lead=%u\n",
+               wake_scheduler.enabled?1u:0u,
+               wake_scheduler.day_start/60u,wake_scheduler.day_start%60u,
+               wake_scheduler.day_end/60u,wake_scheduler.day_end%60u,
+               wake_scheduler.night_start/60u,wake_scheduler.night_start%60u,
+               wake_scheduler.night_end/60u,wake_scheduler.night_end%60u,
+               wake_scheduler.lead_minutes);
+    else
+        printf("EVT|WAKE|schedule|source=none|enabled=0\n");
+    if (wake_recovery_phase!=WAKE_RECOVERY_IDLE)
+        printf("EVT|WAKE|recovery|armed|target=%02u:%02u|attempts=%u\n",
+               wake_store_last.next_start/60u,wake_store_last.next_start%60u,
+               (unsigned)wake_store_last.recovery_attempts);
+    while (true) { uint32_t now = now_ms(); tud_task(); service_cdc(now); service_buttons(now); service_keyboard(now); service_mouse(now); service_cycle(now); guard_runtime_set_input_locked(input_lock_active()); service_light(now); service_buzzer_action(now); service_shift_check(now); service_wake(now); wake_store_service(now,false); service_game_buffs(now); service_vm(now); service_ambient_mouse(now); service_pending_sound_whisper(now); service_global_sound_listener(now); buzzer_service(now); sleep_ms(1); }
 }
